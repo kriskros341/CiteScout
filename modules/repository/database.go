@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // PaperArchive persists scientific papers: their metadata in the database and
@@ -76,6 +77,25 @@ func (a *PaperArchive) PDFPath(filename string) string {
 	return filepath.Join(a.storageDir, filename)
 }
 
+// pdfFilename derives a PDF file name from the paper's DOI (filesystem-safe),
+// falling back to "<id>.pdf" when no DOI is known.
+func pdfFilename(doi string, id int) string {
+	doi = strings.TrimSpace(doi)
+	if doi == "" {
+		return fmt.Sprintf("%d.pdf", id)
+	}
+	// Replace anything outside a safe set (DOIs contain "/", ":", etc.).
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, doi)
+	return safe + ".pdf"
+}
+
 // List returns every paper held in the archive.
 func (a *PaperArchive) List() ([]Paper, error) {
 	rows, err := a.db.Query("SELECT id, title, author, year, abstract, doi, filename FROM papers")
@@ -105,8 +125,9 @@ func (a *PaperArchive) Get(id int) (Paper, error) {
 }
 
 // Create archives a new paper: it stores the metadata, writes the PDF read from
-// pdf into the storage directory as "<id>.pdf", and returns the saved paper. If
-// the file cannot be written, the metadata row is rolled back.
+// pdf into the storage directory (named after the DOI when known, otherwise
+// "<id>.pdf"), and returns the saved paper. If the file cannot be written, the
+// metadata row is rolled back.
 func (a *PaperArchive) Create(paper Paper, pdf io.Reader) (Paper, error) {
 	result, err := a.db.Exec(
 		"INSERT INTO papers (title, author, year, abstract, doi, filename) VALUES (?, ?, ?, ?, ?, '')",
@@ -122,7 +143,7 @@ func (a *PaperArchive) Create(paper Paper, pdf io.Reader) (Paper, error) {
 	}
 	id := int(lastID)
 
-	filename := fmt.Sprintf("%d.pdf", id)
+	filename := pdfFilename(paper.DOI, id)
 	if err := a.writePDF(filename, pdf); err != nil {
 		a.db.Exec("DELETE FROM papers WHERE id = ?", id) // best-effort rollback
 		return Paper{}, err
