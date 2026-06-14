@@ -80,10 +80,10 @@ func TestParseHeader(t *testing.T) {
 	}
 }
 
-func TestParseReferences(t *testing.T) {
-	refs, err := parseReferences(strings.NewReader(sampleTEI))
+func TestParseFulltext(t *testing.T) {
+	refs, err := parseFulltext(strings.NewReader(sampleTEI))
 	if err != nil {
-		t.Fatalf("parseReferences: %v", err)
+		t.Fatalf("parseFulltext: %v", err)
 	}
 	if len(refs) != 2 {
 		t.Fatalf("got %d references, want 2", len(refs))
@@ -113,5 +113,61 @@ func TestParseReferences(t *testing.T) {
 	}
 	if !strings.Contains(refs[1].Text, "Deep Learning") {
 		t.Errorf("ref[1].Text = %q", refs[1].Text)
+	}
+}
+
+const sampleFulltextTEI = `<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+ <text>
+  <body>
+   <div>
+    <p>
+     <s coords="3,72.0,107.4,200.6,12.0">As shown by prior work <ref type="bibr" target="#b0" coords="3,150.0,107.4,8.0,12.0">[1]</ref>, attention helps.</s>
+     <s coords="6,72.0,300.0,200.6,12.0">Following <ref type="bibr" target="#b0" coords="6,90.0,300.0,8.0,12.0">[1]</ref> we adopt the same setup.</s>
+    </p>
+   </div>
+  </body>
+  <back>
+   <div type="references">
+    <listBibl>
+     <biblStruct xml:id="b0">
+      <analytic><title level="a">Attention is all you need</title></analytic>
+      <note type="raw_reference">Vaswani et al. Attention is all you need. 2017.</note>
+     </biblStruct>
+     <biblStruct xml:id="b1">
+      <analytic><title level="a">Deep Learning</title></analytic>
+      <note type="raw_reference">Goodfellow et al. Deep Learning. 2016.</note>
+     </biblStruct>
+    </listBibl>
+   </div>
+  </back>
+ </text>
+</TEI>`
+
+func TestParseFulltextOccurrences(t *testing.T) {
+	refs, err := parseFulltext(strings.NewReader(sampleFulltextTEI))
+	if err != nil {
+		t.Fatalf("parseFulltext: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("got %d references, want 2", len(refs))
+	}
+
+	occ := refs[0].Occurrences
+	if len(occ) != 2 {
+		t.Fatalf("ref[0] got %d occurrences, want 2", len(occ))
+	}
+	if occ[0].Page != 3 {
+		t.Errorf("occ[0].Page = %d, want 3", occ[0].Page)
+	}
+	if !strings.Contains(occ[0].Text, "attention helps") || !strings.Contains(occ[0].Text, "[1]") {
+		t.Errorf("occ[0].Text = %q (should be the full sentence incl. marker)", occ[0].Text)
+	}
+	if occ[1].Page != 6 {
+		t.Errorf("occ[1].Page = %d, want 6", occ[1].Page)
+	}
+
+	if len(refs[1].Occurrences) != 0 {
+		t.Errorf("ref[1] got %d occurrences, want 0", len(refs[1].Occurrences))
 	}
 }

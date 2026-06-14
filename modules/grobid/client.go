@@ -45,6 +45,13 @@ type Header struct {
 	DOI string
 }
 
+// Occurrence is one place in the body where a reference is cited: the sentence
+// containing the in-text marker and the page it appears on.
+type Occurrence struct {
+	Text string
+	Page int
+}
+
 // Reference is a single bibliographic reference extracted from a paper.
 type Reference struct {
 	// Number is the 1-based position of the reference in the bibliography.
@@ -55,6 +62,8 @@ type Reference struct {
 	Text string
 	// DOI is the DOI of the cited work, if GROBID could resolve one.
 	DOI string
+	// Occurrences are the sentences in the body where this reference is cited.
+	Occurrences []Occurrence
 }
 
 // ProcessHeader sends a PDF to GROBID's /api/processHeaderDocument endpoint and
@@ -74,22 +83,29 @@ func (c *Client) ProcessHeader(ctx context.Context, pdf io.Reader) (Header, erro
 	return parseHeader(respBody)
 }
 
-// ProcessReferences sends a PDF to GROBID's /api/processReferences endpoint and
-// returns the parsed references. includeRawCitations is requested so each
-// reference carries its original text.
+// ProcessReferences sends a PDF to GROBID's /api/processFulltextDocument
+// endpoint and returns the parsed references. The full document (not just the
+// reference list) is processed so that, for each reference, we also learn the
+// sentences in the body where it is cited and on which page. segmentSentences
+// gives us sentence boundaries and teiCoordinates=ref annotates each in-text
+// marker with its page coordinates.
 func (c *Client) ProcessReferences(ctx context.Context, pdf io.Reader) ([]Reference, error) {
-	fields := map[string]string{"includeRawCitations": "1"}
+	fields := map[string]string{
+		"includeRawCitations": "1",
+		"segmentSentences":     "1",
+		"teiCoordinates":       "ref",
+	}
 	if c.Consolidate {
 		fields["consolidateCitations"] = "1"
 	}
 
-	respBody, err := c.postPDF(ctx, "/api/processReferences", pdf, fields)
+	respBody, err := c.postPDF(ctx, "/api/processFulltextDocument", pdf, fields)
 	if err != nil {
 		return nil, err
 	}
 	defer respBody.Close()
 
-	return parseReferences(respBody)
+	return parseFulltext(respBody)
 }
 
 // postPDF uploads a PDF as multipart/form-data to a GROBID endpoint along with
@@ -257,14 +273,37 @@ type teiBiblStruct struct {
 	Notes         []teiNote `xml:"note"`
 }
 
-// parseReferences streams the TEI XML response and decodes each <biblStruct>
-// into a Reference. Nested biblStruct elements are consumed by DecodeElement,
-// so they are not counted twice.
-func parseReferences(r io.Reader) ([]Reference, error) {
-	dec := xml.NewDecoder(r)
+// teiRef is an in-text reference marker, e.g. <ref type="bibr" target="#b2">.
+type teiRef struct {
+	Type   string `xml:"type,attr"`
+	Target string `xml:"target,attr"`
+	Coords string `xml:"coords,attr"`
+}
 
-	var refs []Reference
-	number := 0
+// teiSentence is a segmented sentence in the body. InnerXML preserves its full
+// text (including the marker text inside child elements), and Refs gives the
+// in-text reference markers it contains.
+type teiSentence struct {
+	Coords   string   `xml:"coords,attr"`
+	InnerXML string   `xml:",innerxml"`
+	Refs     []teiRef `xml:"ref"`
+}
+
+// parseFulltext streams a TEI full-text document. It collects the bibliography
+// entries (<biblStruct> with an xml:id) and, from the body sentences (<s>), the
+// in-text citation occurrences, which it attaches to the matching reference by
+// the marker's target id.
+func parseFulltext(r io.Reader) ([]Reference, error) {
+	dec := xml.NewDecoder(r)
+	dec.Strict = false
+
+	var (
+		refs    []*Reference
+		refIDs  []string                 // parallel to refs, the biblStruct xml:id
+		occByID = map[string][]Occurrence{} // target id -> occurrences
+		number  int
+	)
+
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -275,35 +314,122 @@ func parseReferences(r io.Reader) ([]Reference, error) {
 		}
 
 		start, ok := tok.(xml.StartElement)
-		if !ok || start.Name.Local != "biblStruct" {
+		if !ok {
 			continue
 		}
 
-		var bs teiBiblStruct
-		if err := dec.DecodeElement(&bs, &start); err != nil {
-			return nil, err
-		}
-
-		number++
-		ref := Reference{Number: number}
-
-		ref.Title = firstNonEmpty(append(bs.AnalyticTitle, bs.MonogrTitle...))
-
-		for _, idno := range append(bs.AnalyticIdno, bs.MonogrIdno...) {
-			if strings.EqualFold(idno.Type, "DOI") {
-				ref.DOI = strings.TrimSpace(idno.Value)
-				break
+		switch start.Name.Local {
+		case "s":
+			var s teiSentence
+			if err := dec.DecodeElement(&s, &start); err != nil {
+				return nil, err
 			}
-		}
-		for _, note := range bs.Notes {
-			if note.Type == "raw_reference" {
-				ref.Text = strings.TrimSpace(note.Value)
-				break
+			sentence := plainText(s.InnerXML)
+			for _, rf := range s.Refs {
+				if !strings.EqualFold(rf.Type, "bibr") {
+					continue
+				}
+				id := strings.TrimPrefix(rf.Target, "#")
+				if id == "" {
+					continue
+				}
+				page := coordPage(rf.Coords)
+				if page == 0 {
+					page = coordPage(s.Coords)
+				}
+				occByID[id] = append(occByID[id], Occurrence{Text: sentence, Page: page})
 			}
-		}
 
-		refs = append(refs, ref)
+		case "biblStruct":
+			// Only bibliography entries carry an xml:id; the document's own
+			// biblStruct (in the header) does not, so skip it.
+			id := attrValue(start, "id")
+			if id == "" {
+				dec.Skip()
+				continue
+			}
+
+			var bs teiBiblStruct
+			if err := dec.DecodeElement(&bs, &start); err != nil {
+				return nil, err
+			}
+
+			number++
+			ref := &Reference{
+				Number: number,
+				Title:  firstNonEmpty(append(bs.AnalyticTitle, bs.MonogrTitle...)),
+			}
+			for _, idno := range append(bs.AnalyticIdno, bs.MonogrIdno...) {
+				if strings.EqualFold(idno.Type, "DOI") {
+					ref.DOI = strings.TrimSpace(idno.Value)
+					break
+				}
+			}
+			for _, note := range bs.Notes {
+				if note.Type == "raw_reference" {
+					ref.Text = strings.TrimSpace(note.Value)
+					break
+				}
+			}
+			refs = append(refs, ref)
+			refIDs = append(refIDs, id)
+		}
 	}
 
-	return refs, nil
+	// The body precedes the bibliography, so occurrences are attached only now
+	// that every reference is known.
+	result := make([]Reference, len(refs))
+	for i, ref := range refs {
+		ref.Occurrences = occByID[refIDs[i]]
+		result[i] = *ref
+	}
+	return result, nil
+}
+
+// attrValue returns the value of the named attribute (ignoring namespace), or
+// "" if absent.
+func attrValue(se xml.StartElement, local string) string {
+	for _, a := range se.Attr {
+		if a.Name.Local == local {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+// plainText extracts the character data from a fragment of TEI XML, collapsing
+// runs of whitespace into single spaces.
+func plainText(innerXML string) string {
+	dec := xml.NewDecoder(strings.NewReader("<x>" + innerXML + "</x>"))
+	dec.Strict = false
+
+	var b strings.Builder
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		if cd, ok := tok.(xml.CharData); ok {
+			b.Write(cd)
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// coordPage returns the page number from a TEI coords attribute, whose first
+// field is the page (e.g. "3,72.0,107.4,200.6,12.0"). Returns 0 if unavailable.
+func coordPage(coords string) int {
+	coords = strings.TrimSpace(coords)
+	if coords == "" {
+		return 0
+	}
+	if i := strings.IndexByte(coords, ';'); i >= 0 {
+		coords = coords[:i] // first bounding box only
+	}
+	fields := strings.Split(coords, ",")
+	page, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+	if err != nil {
+		return 0
+	}
+	return page
 }

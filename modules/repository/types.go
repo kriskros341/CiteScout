@@ -28,4 +28,13 @@ type Citation struct {
 	Text string `json:"text"`
 	// DOI is the DOI of the cited work, if one was resolved.
 	DOI string `json:"doi"`
+	// Occurrences are the sentences in the body where this citation is cited.
+	Occurrences []Occurrence `json:"occurrences"`
+}
+
+// Occurrence is one place in the body where a citation is referenced: the
+// sentence containing the in-text marker and the page it appears on.
+type Occurrence struct {
+	Text string `json:"text"`
+	Page int    `json:"page"`
 }

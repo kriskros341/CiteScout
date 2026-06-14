@@ -51,7 +51,18 @@ func (a *PaperArchive) EnsureReady() error {
 		"doi" TEXT,
 		FOREIGN KEY(paper_id) REFERENCES papers(id)
 	);`
-	_, err := a.db.Exec(createCitationsSQL)
+	if _, err := a.db.Exec(createCitationsSQL); err != nil {
+		return err
+	}
+
+	const createOccurrencesSQL = `CREATE TABLE IF NOT EXISTS citation_occurrences (
+		"id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+		"citation_id" INTEGER,
+		"occurrence_text" TEXT,
+		"page" INTEGER,
+		FOREIGN KEY(citation_id) REFERENCES citations(id)
+	);`
+	_, err := a.db.Exec(createOccurrencesSQL)
 	return err
 }
 
@@ -157,6 +168,9 @@ func (a *PaperArchive) Delete(id int) (bool, error) {
 		return false, err
 	}
 
+	if _, err := a.db.Exec("DELETE FROM citation_occurrences WHERE citation_id IN (SELECT id FROM citations WHERE paper_id = ?)", id); err != nil {
+		return false, err
+	}
 	if _, err := a.db.Exec("DELETE FROM citations WHERE paper_id = ?", id); err != nil {
 		return false, err
 	}
@@ -178,23 +192,69 @@ func (a *PaperArchive) ReplaceCitations(paperID int, citations []Citation) error
 	}
 	defer tx.Rollback()
 
+	if _, err := tx.Exec("DELETE FROM citation_occurrences WHERE citation_id IN (SELECT id FROM citations WHERE paper_id = ?)", paperID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM citations WHERE paper_id = ?", paperID); err != nil {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO citations (paper_id, citation_number, citation_title, citation_text, doi) VALUES (?, ?, ?, ?, ?)")
+	citStmt, err := tx.Prepare("INSERT INTO citations (paper_id, citation_number, citation_title, citation_text, doi) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer citStmt.Close()
+
+	occStmt, err := tx.Prepare("INSERT INTO citation_occurrences (citation_id, occurrence_text, page) VALUES (?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer occStmt.Close()
 
 	for _, c := range citations {
-		if _, err := stmt.Exec(paperID, c.Number, c.Title, c.Text, c.DOI); err != nil {
+		result, err := citStmt.Exec(paperID, c.Number, c.Title, c.Text, c.DOI)
+		if err != nil {
 			return err
+		}
+		citationID, err := result.LastInsertId()
+		if err != nil {
+			return err
+		}
+		for _, o := range c.Occurrences {
+			if _, err := occStmt.Exec(citationID, o.Text, o.Page); err != nil {
+				return err
+			}
 		}
 	}
 
 	return tx.Commit()
+}
+
+// GetCitation returns a single citation by its ID (without occurrences). It
+// returns sql.ErrNoRows when none exists.
+func (a *PaperArchive) GetCitation(citationID int) (Citation, error) {
+	var (
+		c   Citation
+		pid sql.NullInt64
+	)
+	err := a.db.QueryRow(
+		"SELECT id, paper_id, citation_number, citation_title, citation_text, doi FROM citations WHERE id = ?",
+		citationID,
+	).Scan(&c.ID, &pid, &c.Number, &c.Title, &c.Text, &c.DOI)
+	if err != nil {
+		return Citation{}, err
+	}
+	if pid.Valid {
+		id := int(pid.Int64)
+		c.PaperID = &id
+	}
+	return c, nil
+}
+
+// UpdateCitationDOI sets the DOI of a single citation.
+func (a *PaperArchive) UpdateCitationDOI(citationID int, doi string) error {
+	_, err := a.db.Exec("UPDATE citations SET doi = ? WHERE id = ?", doi, citationID)
+	return err
 }
 
 // CitationsForPaper returns the citations stored for a paper, ordered by their
@@ -207,24 +267,58 @@ func (a *PaperArchive) CitationsForPaper(paperID int) ([]Citation, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var citations []Citation
+	indexByID := map[int]int{} // citation id -> position in citations
 	for rows.Next() {
 		var (
 			c   Citation
 			pid sql.NullInt64
 		)
 		if err := rows.Scan(&c.ID, &pid, &c.Number, &c.Title, &c.Text, &c.DOI); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if pid.Valid {
 			id := int(pid.Int64)
 			c.PaperID = &id
 		}
+		indexByID[c.ID] = len(citations)
 		citations = append(citations, c)
 	}
-	return citations, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	// Attach occurrences to their citations.
+	occRows, err := a.db.Query(
+		`SELECT o.citation_id, o.occurrence_text, o.page
+		 FROM citation_occurrences o
+		 JOIN citations c ON c.id = o.citation_id
+		 WHERE c.paper_id = ?
+		 ORDER BY o.id`,
+		paperID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer occRows.Close()
+
+	for occRows.Next() {
+		var (
+			citationID int
+			o          Occurrence
+		)
+		if err := occRows.Scan(&citationID, &o.Text, &o.Page); err != nil {
+			return nil, err
+		}
+		if i, ok := indexByID[citationID]; ok {
+			citations[i].Occurrences = append(citations[i].Occurrences, o)
+		}
+	}
+	return citations, occRows.Err()
 }
 
 // writePDF copies the contents of src into a file inside the storage directory.

@@ -1,19 +1,52 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3" // Import the SQLite driver
 
+	doi "restapi/modules/doi"
 	"restapi/modules/grobid"
 	"restapi/modules/repository"
 )
 
+// loadDotEnv reads simple KEY=VALUE lines from path into the environment. Lines
+// may be blank, comments (#...), or optionally prefixed with "export". Existing
+// environment variables are not overridden. A missing file is not an error.
+func loadDotEnv(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(scanner.Text()), "export "))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, value)
+		}
+	}
+}
+
 func main() {
+	loadDotEnv(".env")
+
 	// Open the SQLite database. It will be created if it doesn't exist.
 	db, err := sql.Open("sqlite3", "./archive.db")
 	if err != nil {
@@ -44,7 +77,24 @@ func main() {
 	// Set GROBID_CONSOLIDATE=1 to resolve citation DOIs against CrossRef
 	// (slower, needs network access).
 	grobidClient.Consolidate = os.Getenv("GROBID_CONSOLIDATE") == "1"
-	handlers := repository.NewPaperArchiveHandlers(archive, grobidClient)
+
+	// Optional Gemini-backed DOI lookup (web search), run via a background task
+	// queue. Enabled when GEMINI_API_KEY is set; override the model with
+	// GEMINI_MODEL.
+	var doiQueue *repository.DOIQueue
+	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
+		gemini := doi.NewClient(key)
+		if model := os.Getenv("GEMINI_MODEL"); model != "" {
+			gemini.Model = model
+		}
+		doiQueue = repository.NewDOIQueue(archive, gemini, 64)
+		doiQueue.Start(2) // worker goroutines
+		fmt.Printf("DOI lookup enabled via Gemini model %s\n", gemini.Model)
+	} else {
+		fmt.Println("DOI lookup disabled (set GEMINI_API_KEY to enable)")
+	}
+
+	handlers := repository.NewPaperArchiveHandlers(archive, grobidClient, doiQueue)
 
 	mux := http.NewServeMux()
 	handlers.Register(mux)
