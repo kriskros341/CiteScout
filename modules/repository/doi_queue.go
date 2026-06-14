@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"restapi/modules/doi"
+	"citescout/modules/doi"
 )
 
 // DOI resolution job statuses, as shown on the paper page.

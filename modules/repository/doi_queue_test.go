@@ -9,7 +9,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
-	"restapi/modules/doi"
+	"citescout/modules/doi"
 )
 
 // fakeResolver returns a fixed DOI for every query.

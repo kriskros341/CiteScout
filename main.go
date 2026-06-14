@@ -11,9 +11,9 @@ import (
 
 	_ "github.com/mattn/go-sqlite3" // Import the SQLite driver
 
-	doi "restapi/modules/doi"
-	"restapi/modules/grobid"
-	"restapi/modules/repository"
+	doi "citescout/modules/doi"
+	"citescout/modules/grobid"
+	"citescout/modules/repository"
 )
 
 // loadDotEnv reads simple KEY=VALUE lines from path into the environment. Lines

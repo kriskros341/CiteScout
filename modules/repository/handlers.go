@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"restapi/modules/doi"
-	"restapi/modules/grobid"
+	"citescout/modules/doi"
+	"citescout/modules/grobid"
 )
 
 // maxUploadMemory is how much of a multipart upload is buffered in memory; the
