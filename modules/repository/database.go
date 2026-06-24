@@ -37,9 +37,14 @@ func (a *PaperArchive) EnsureReady() error {
 		"year" INTEGER,
 		"abstract" TEXT,
 		"doi" TEXT,
+		"hash" TEXT,
 		"filename" TEXT
 	);`
 	if _, err := a.db.Exec(createPapersSQL); err != nil {
+		return err
+	}
+	// Add the hash column to databases created before deduplication existed.
+	if err := a.ensureColumn("papers", "hash", "TEXT"); err != nil {
 		return err
 	}
 
@@ -63,7 +68,54 @@ func (a *PaperArchive) EnsureReady() error {
 		"page" INTEGER,
 		FOREIGN KEY(citation_id) REFERENCES citations(id)
 	);`
-	_, err := a.db.Exec(createOccurrencesSQL)
+	if _, err := a.db.Exec(createOccurrencesSQL); err != nil {
+		return err
+	}
+
+	// paper_tags holds free-form labels attached to a paper. The unique index
+	// keeps a tag from being stored twice on the same paper.
+	const createTagsSQL = `CREATE TABLE IF NOT EXISTS paper_tags (
+		"id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+		"paper_id" INTEGER NOT NULL,
+		"tag" TEXT NOT NULL,
+		FOREIGN KEY(paper_id) REFERENCES papers(id)
+	);`
+	if _, err := a.db.Exec(createTagsSQL); err != nil {
+		return err
+	}
+	const createTagsIndexSQL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_tags_unique ON paper_tags(paper_id, tag);`
+	_, err := a.db.Exec(createTagsIndexSQL)
+	return err
+}
+
+// ensureColumn adds a column to a table if it is not already present, so an
+// existing database is migrated forward without dropping data. SQLite has no
+// "ADD COLUMN IF NOT EXISTS", so the current columns are inspected first.
+func (a *PaperArchive) ensureColumn(table, column, columnType string) error {
+	rows, err := a.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err() // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = a.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType))
 	return err
 }
 
@@ -96,23 +148,22 @@ func pdfFilename(doi string, id int) string {
 	return safe + ".pdf"
 }
 
-// List returns every paper held in the archive.
+// List returns every paper held in the archive (with its tags), unfiltered.
 func (a *PaperArchive) List() ([]Paper, error) {
-	rows, err := a.db.Query("SELECT id, title, author, year, abstract, doi, filename FROM papers")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	return a.ListFiltered(FilterOptions{})
+}
 
-	var papers []Paper
-	for rows.Next() {
-		var paper Paper
-		if err := rows.Scan(&paper.ID, &paper.Title, &paper.Author, &paper.Year, &paper.Abstract, &paper.DOI, &paper.Filename); err != nil {
-			return nil, err
-		}
-		papers = append(papers, paper)
+// FindByHash returns the paper whose stored PDF has the given content hash. It
+// returns sql.ErrNoRows when no paper matches, and is used to reject duplicate
+// uploads. An empty hash never matches.
+func (a *PaperArchive) FindByHash(hash string) (Paper, error) {
+	var paper Paper
+	if hash == "" {
+		return Paper{}, sql.ErrNoRows
 	}
-	return papers, rows.Err()
+	err := a.db.QueryRow("SELECT id, title, author, year, abstract, doi, filename FROM papers WHERE hash = ?", hash).
+		Scan(&paper.ID, &paper.Title, &paper.Author, &paper.Year, &paper.Abstract, &paper.DOI, &paper.Filename)
+	return paper, err
 }
 
 // Get returns a single paper identified by its ID. It returns sql.ErrNoRows
@@ -121,7 +172,15 @@ func (a *PaperArchive) Get(id int) (Paper, error) {
 	var paper Paper
 	err := a.db.QueryRow("SELECT id, title, author, year, abstract, doi, filename FROM papers WHERE id = ?", id).
 		Scan(&paper.ID, &paper.Title, &paper.Author, &paper.Year, &paper.Abstract, &paper.DOI, &paper.Filename)
-	return paper, err
+	if err != nil {
+		return Paper{}, err
+	}
+	tags, err := a.TagsForPaper(id)
+	if err != nil {
+		return Paper{}, err
+	}
+	paper.Tags = tags
+	return paper, nil
 }
 
 // Create archives a new paper: it stores the metadata, writes the PDF read from
@@ -130,8 +189,8 @@ func (a *PaperArchive) Get(id int) (Paper, error) {
 // metadata row is rolled back.
 func (a *PaperArchive) Create(paper Paper, pdf io.Reader) (Paper, error) {
 	result, err := a.db.Exec(
-		"INSERT INTO papers (title, author, year, abstract, doi, filename) VALUES (?, ?, ?, ?, ?, '')",
-		paper.Title, paper.Author, paper.Year, paper.Abstract, paper.DOI,
+		"INSERT INTO papers (title, author, year, abstract, doi, hash, filename) VALUES (?, ?, ?, ?, ?, ?, '')",
+		paper.Title, paper.Author, paper.Year, paper.Abstract, paper.DOI, paper.Hash,
 	)
 	if err != nil {
 		return Paper{}, err

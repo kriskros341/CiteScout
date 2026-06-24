@@ -1,0 +1,10 @@
+# Keep the build context small and avoid baking runtime/secret files into the
+# image. Configuration is provided at run time via docker-compose env_file, and
+# the database and PDFs are bind-mounted.
+.git
+.env
+archive.db
+data
+dist
+raport
+*.pdf

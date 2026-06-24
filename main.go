@@ -11,8 +11,10 @@ import (
 
 	_ "github.com/mattn/go-sqlite3" // Import the SQLite driver
 
+	"citescout/modules/auth"
 	doi "citescout/modules/doi"
 	"citescout/modules/grobid"
+	"citescout/modules/openalex"
 	"citescout/modules/repository"
 )
 
@@ -94,13 +96,30 @@ func main() {
 		fmt.Println("DOI lookup disabled (set GEMINI_API_KEY to enable)")
 	}
 
-	handlers := repository.NewPaperArchiveHandlers(archive, grobidClient, doiQueue)
+	// "Cited by" discovery via OpenAlex (no API key needed). Set OPENALEX_MAILTO
+	// to a contact email to join OpenAlex's faster "polite pool".
+	openAlex := openalex.NewClient(os.Getenv("OPENALEX_MAILTO"))
+
+	handlers := repository.NewPaperArchiveHandlers(archive, grobidClient, doiQueue, openAlex)
 
 	mux := http.NewServeMux()
 	handlers.Register(mux)
 
+	// Optional single-password login. Enabled when AUTH_PASSWORD_HASH is set to
+	// the SHA-256 hex digest of the password; otherwise the site is open. Set the
+	// hash with: printf '%s' 'yourpassword' | sha256sum
+	authn := auth.New(os.Getenv("AUTH_PASSWORD_HASH"))
+	handlers.AuthEnabled = authn.Enabled()
+	authn.Register(mux)
+	var handler http.Handler = authn.Middleware(mux)
+	if authn.Enabled() {
+		fmt.Println("Authentication enabled (login required)")
+	} else {
+		fmt.Println("Authentication disabled (set AUTH_PASSWORD_HASH to enable)")
+	}
+
 	fmt.Printf("Scientific paper archive starting on port 8080 (storing PDFs in %q)...\n", storageDir)
 	fmt.Printf("Extracting metadata and citations via GROBID at %s\n", grobidURL)
 	fmt.Println("Open http://localhost:8080/new to upload a paper.")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }

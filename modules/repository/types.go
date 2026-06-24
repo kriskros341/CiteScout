@@ -10,8 +10,14 @@ type Paper struct {
 	Year     int    `json:"year"`
 	Abstract string `json:"abstract"`
 	// DOI is the paper's own DOI, if GROBID extracted one.
-	DOI      string `json:"doi"`
+	DOI string `json:"doi"`
+	// Hash is the SHA-256 of the PDF contents, used to detect duplicate uploads.
+	// It is an internal bookkeeping field and is not exposed over the API.
+	Hash     string `json:"-"`
 	Filename string `json:"filename"`
+	// Tags are the free-form labels attached to this paper. They are populated
+	// by the read methods that join paper_tags.
+	Tags []string `json:"tags,omitempty"`
 }
 
 // Citation is a single bibliographic reference extracted from a paper.

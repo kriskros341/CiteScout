@@ -3,20 +3,25 @@ package repository
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"citescout/modules/doi"
 	"citescout/modules/grobid"
+	"citescout/modules/openalex"
 )
 
 // maxUploadMemory is how much of a multipart upload is buffered in memory; the
@@ -36,6 +41,12 @@ type DOIResolver interface {
 	FindDOI(ctx context.Context, query doi.Query) (string, error)
 }
 
+// CitingWorksFinder finds works that cite a paper, given its DOI. It is
+// satisfied by *openalex.Client.
+type CitingWorksFinder interface {
+	CitingWorks(ctx context.Context, doi string) ([]openalex.Work, error)
+}
+
 // PaperArchiveHandlers exposes the scientific paper archive over HTTP. It holds
 // only request/response logic and delegates persistence to the PaperArchive,
 // metadata/citation extraction to GROBID, and background DOI lookups to a queue.
@@ -43,13 +54,17 @@ type PaperArchiveHandlers struct {
 	archive  *PaperArchive
 	grobid   paperAnalyzer
 	doiQueue *DOIQueue
+	citing   CitingWorksFinder
+	// AuthEnabled controls whether the UI shows a "log out" link; set it to match
+	// the auth middleware so the link is hidden when the site is open.
+	AuthEnabled bool
 }
 
 // NewPaperArchiveHandlers wires HTTP handlers to the given archive. grobid may
-// be nil (no metadata/citation extraction on upload) and doiQueue may be nil
-// (DOI lookup disabled).
-func NewPaperArchiveHandlers(archive *PaperArchive, grobid paperAnalyzer, doiQueue *DOIQueue) *PaperArchiveHandlers {
-	return &PaperArchiveHandlers{archive: archive, grobid: grobid, doiQueue: doiQueue}
+// be nil (no metadata/citation extraction on upload), doiQueue may be nil (DOI
+// lookup disabled) and citing may be nil ("cited by" discovery disabled).
+func NewPaperArchiveHandlers(archive *PaperArchive, grobid paperAnalyzer, doiQueue *DOIQueue, citing CitingWorksFinder) *PaperArchiveHandlers {
+	return &PaperArchiveHandlers{archive: archive, grobid: grobid, doiQueue: doiQueue, citing: citing}
 }
 
 // Register wires the archive's routes onto the given mux:
@@ -95,7 +110,7 @@ func (h *PaperArchiveHandlers) api(w http.ResponseWriter, r *http.Request) {
 	if rest == "" {
 		switch r.Method {
 		case http.MethodGet:
-			h.listPapers(w)
+			h.listPapers(w, r)
 		case http.MethodPost:
 			h.createPaper(w, r)
 		default:
@@ -120,6 +135,14 @@ func (h *PaperArchiveHandlers) api(w http.ResponseWriter, r *http.Request) {
 			h.requireGet(w, r, func() { h.servePDF(w, r, id, "inline") })
 		case "citations":
 			h.requireGet(w, r, func() { h.listCitations(w, id) })
+		case "tags":
+			if r.Method != http.MethodPost {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			h.setPaperTags(w, r, id)
+		case "citing-works":
+			h.requireGet(w, r, func() { h.citingWorks(w, r, id) })
 		default:
 			http.NotFound(w, r)
 		}
@@ -156,16 +179,45 @@ func (h *PaperArchiveHandlers) uploadForm(w http.ResponseWriter, r *http.Request
 	w.Write([]byte(uploadFormHTML))
 }
 
-// listPage renders the HTML index of all papers, with a link to add one.
-func (h *PaperArchiveHandlers) listPage(w http.ResponseWriter) {
-	papers, err := h.archive.List()
+// listPage renders the HTML index of papers, honouring the author/tag/q filter
+// query parameters, with a link to add one and the available authors and tags
+// to filter by.
+func (h *PaperArchiveHandlers) listPage(w http.ResponseWriter, r *http.Request) {
+	filter := filterFromQuery(r)
+	papers, err := h.archive.ListFiltered(filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	authors, err := h.archive.Authors()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	tags, err := h.archive.AllTags()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := paperListTemplate.Execute(w, papers); err != nil {
+	if err := paperListTemplate.Execute(w, struct {
+		Papers      []Paper
+		Authors     []string
+		Tags        []string
+		Filter      FilterOptions
+		AuthEnabled bool
+	}{papers, authors, tags, filter, h.AuthEnabled}); err != nil {
 		log.Printf("rendering paper list: %v", err)
+	}
+}
+
+// filterFromQuery reads the author/tag/q filter parameters from a request.
+func filterFromQuery(r *http.Request) FilterOptions {
+	return FilterOptions{
+		Author: strings.TrimSpace(r.URL.Query().Get("author")),
+		Tag:    strings.TrimSpace(r.URL.Query().Get("tag")),
+		Query:  strings.TrimSpace(r.URL.Query().Get("q")),
 	}
 }
 
@@ -179,7 +231,7 @@ func (h *PaperArchiveHandlers) paperPage(w http.ResponseWriter, r *http.Request)
 
 	idStr := strings.Trim(strings.TrimPrefix(r.URL.Path, "/papers/"), "/")
 	if idStr == "" {
-		h.listPage(w)
+		h.listPage(w, r)
 		return
 	}
 	id, err := strconv.Atoi(idStr)
@@ -211,11 +263,13 @@ func (h *PaperArchiveHandlers) paperPage(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := paperPageTemplate.Execute(w, struct {
-		Paper     Paper
-		Citations []citationView
+		Paper           Paper
+		Citations       []citationView
+		CitingAvailable bool
 	}{
-		Paper:     paper,
-		Citations: views,
+		Paper:           paper,
+		Citations:       views,
+		CitingAvailable: h.citing != nil,
 	}); err != nil {
 		log.Printf("rendering paper page %d: %v", id, err)
 	}
@@ -261,8 +315,8 @@ func (h *PaperArchiveHandlers) renderDOICell(w http.ResponseWriter, citationID i
 	}
 }
 
-func (h *PaperArchiveHandlers) listPapers(w http.ResponseWriter) {
-	papers, err := h.archive.List()
+func (h *PaperArchiveHandlers) listPapers(w http.ResponseWriter, r *http.Request) {
+	papers, err := h.archive.ListFiltered(filterFromQuery(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -334,8 +388,24 @@ func (h *PaperArchiveHandlers) createPaper(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Deduplicate by content hash: an identical PDF is not archived twice. The
+	// browser is sent to the paper that already holds it.
+	hash, err := hashPDF(pdf)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if existing, err := h.archive.FindByHash(hash); err == nil {
+		http.Redirect(w, r, "/papers/"+strconv.Itoa(existing.ID), http.StatusSeeOther)
+		return
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	// Analyse the PDF for its metadata before persisting anything.
 	paper := h.analyzeHeader(pdf)
+	paper.Hash = hash
 
 	// Rewind so the same PDF can be written to disk by the archive.
 	if _, err := pdf.Seek(0, io.SeekStart); err != nil {
@@ -371,11 +441,39 @@ func isPDF(rs io.ReadSeeker) bool {
 	return n == 5 && string(head) == "%PDF-"
 }
 
-// downloadPDF fetches a PDF from a URL (size-limited). Note: this performs a
-// server-side request to a user-supplied URL — fine for local use, but exposes
-// SSRF surface if the server is ever public.
+// hashPDF computes the SHA-256 of the stream's contents (as a hex string),
+// rewinding it afterwards so the PDF can be read again for analysis and storage.
+func hashPDF(rs io.ReadSeeker) (string, error) {
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, rs); err != nil {
+		return "", err
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// downloadPDF fetches a PDF from a URL (size-limited). The URL is a user-supplied
+// value fetched server-side, so it is validated first to blunt SSRF: only
+// http/https is allowed and the host must resolve to a public address. Each
+// redirect hop is re-validated so a public URL cannot bounce to an internal one.
 func downloadPDF(rawURL string) ([]byte, error) {
-	client := &http.Client{Timeout: 60 * time.Second}
+	if err := validateFetchURL(rawURL); err != nil {
+		return nil, err
+	}
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return validateFetchURL(req.URL.String())
+		},
+	}
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, err
@@ -391,6 +489,42 @@ func downloadPDF(rawURL string) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// validateFetchURL allows only http/https URLs whose host resolves entirely to
+// public addresses, rejecting loopback, private, link-local and other
+// non-public targets so a fetch cannot reach internal services.
+func validateFetchURL(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme %q (only http and https)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("URL has no host")
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve host %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if !isPublicIP(ip) {
+			return fmt.Errorf("refusing to fetch from non-public address %s", ip)
+		}
+	}
+	return nil
+}
+
+// isPublicIP reports whether ip is a routable public address.
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	return true
 }
 
 // analyzeHeader asks GROBID for a paper's metadata. Extraction failures are
@@ -472,6 +606,82 @@ func (h *PaperArchiveHandlers) listCitations(w http.ResponseWriter, id int) {
 		return
 	}
 	writeJSON(w, http.StatusOK, citations)
+}
+
+// setPaperTags replaces a paper's tags from a comma-separated "tags" form field,
+// then (for HTMX) re-renders the tag cell or (otherwise) redirects to the paper.
+func (h *PaperArchiveHandlers) setPaperTags(w http.ResponseWriter, r *http.Request, id int) {
+	if _, err := h.archive.Get(id); errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "Paper not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tags := strings.Split(r.FormValue("tags"), ",")
+	if err := h.archive.SetTags(id, tags); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if r.Header.Get("HX-Request") != "" {
+		h.renderTagsCell(w, id)
+		return
+	}
+	http.Redirect(w, r, "/papers/"+strconv.Itoa(id), http.StatusSeeOther)
+}
+
+// renderTagsCell writes the HTMX fragment for a paper's tags editor.
+func (h *PaperArchiveHandlers) renderTagsCell(w http.ResponseWriter, id int) {
+	tags, err := h.archive.TagsForPaper(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := paperPageTemplate.ExecuteTemplate(w, "tagsCell", tagsCellData{ID: id, Tags: tags}); err != nil {
+		log.Printf("rendering tags cell %d: %v", id, err)
+	}
+}
+
+// citingWorks fetches works that cite a paper (via OpenAlex, on demand) and
+// renders them as an HTML fragment for the paper page.
+func (h *PaperArchiveHandlers) citingWorks(w http.ResponseWriter, r *http.Request, id int) {
+	if h.citing == nil {
+		http.Error(w, "Citing-works discovery is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	paper, err := h.archive.Get(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "Paper not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if strings.TrimSpace(paper.DOI) == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<p>This paper has no DOI, so citing works cannot be looked up.</p>"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	works, err := h.citing.CitingWorks(ctx, paper.DOI)
+	if err != nil {
+		log.Printf("citing-works: paper %d: %v", id, err)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<p>Could not fetch citing works right now. Try again later.</p>"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := paperPageTemplate.ExecuteTemplate(w, "citingWorks", works); err != nil {
+		log.Printf("rendering citing works %d: %v", id, err)
+	}
 }
 
 // requireGet runs handle only for GET requests, otherwise replies 405.
@@ -665,7 +875,8 @@ document.</p>
 </html>
 `
 
-// paperListTemplate renders the index of archived papers. Data is []Paper.
+// paperListTemplate renders the index of archived papers, with a filter bar and
+// the available authors and tags. Data carries Papers, Authors, Tags and Filter.
 var paperListTemplate = template.Must(template.New("list").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -675,26 +886,47 @@ var paperListTemplate = template.Must(template.New("list").Parse(`<!DOCTYPE html
 </head>
 <body>
 <h1>Scientific paper archive</h1>
-<p><a href="/new">+ Add paper</a></p>
-{{if .}}<table border="1" cellpadding="4" cellspacing="0">
-<thead><tr><th>Title</th><th>Author</th><th>Year</th><th>DOI</th><th></th><th></th></tr></thead>
+<p><a href="/new">+ Add paper</a>{{if .AuthEnabled}} &middot; <a href="/logout">log out</a>{{end}}</p>
+
+<form method="get" action="/papers/">
+	<input type="text" name="q" value="{{.Filter.Query}}" placeholder="search title, abstract, references" size="34">
+	<input type="text" name="author" value="{{.Filter.Author}}" placeholder="author" size="18">
+	<input type="text" name="tag" value="{{.Filter.Tag}}" placeholder="tag" size="12">
+	<button type="submit">Filter</button>
+	{{if or .Filter.Query .Filter.Author .Filter.Tag}}<a href="/papers/">clear</a>{{end}}
+</form>
+{{if .Authors}}<p>Authors: {{range .Authors}}<a href="/papers/?author={{.}}">{{.}}</a> {{end}}</p>{{end}}
+{{if .Tags}}<p>Tags: {{range .Tags}}<a href="/papers/?tag={{.}}">{{.}}</a> {{end}}</p>{{end}}
+
+{{if .Papers}}<table border="1" cellpadding="4" cellspacing="0">
+<thead><tr><th>Title</th><th>Author</th><th>Year</th><th>DOI</th><th>Tags</th><th></th><th></th></tr></thead>
 <tbody>
-{{range .}}	<tr>
+{{range .Papers}}	<tr>
 		<td><a href="/papers/{{.ID}}">{{if .Title}}{{.Title}}{{else}}(untitled #{{.ID}}){{end}}</a></td>
 		<td>{{if .Author}}{{.Author}}{{else}}&mdash;{{end}}</td>
 		<td>{{if .Year}}{{.Year}}{{else}}&mdash;{{end}}</td>
 		<td>{{if .DOI}}<a href="https://doi.org/{{.DOI}}">{{.DOI}}</a>{{else}}&mdash;{{end}}</td>
+		<td>{{if .Tags}}{{range .Tags}}<small>{{.}}</small> {{end}}{{else}}&mdash;{{end}}</td>
 		<td><a href="/api/papers/{{.ID}}/view" target="_blank">view</a></td>
 		<td><button hx-delete="/api/papers/{{.ID}}" hx-confirm="Delete this paper and its PDF?" hx-target="closest tr" hx-swap="outerHTML">delete</button></td>
 	</tr>
 {{end}}</tbody>
-</table>{{else}}<p>No papers yet. <a href="/new">Add one</a>.</p>{{end}}
+</table>{{else}}<p>No papers found.{{if or .Filter.Query .Filter.Author .Filter.Tag}} <a href="/papers/">Clear filters</a>.{{else}} <a href="/new">Add one</a>.{{end}}</p>{{end}}
 </body>
 </html>
 `))
 
+// tagsCellData is the data for the tagsCell fragment: a paper id and its tags.
+type tagsCellData struct {
+	ID   int
+	Tags []string
+}
+
 // paperPageTemplate renders a single paper's metadata and its citation list.
-var paperPageTemplate = template.Must(template.New("paper").Parse(`<!DOCTYPE html>
+var paperPageTemplate = template.Must(template.New("paper").Funcs(template.FuncMap{
+	"tagsData": func(id int, tags []string) tagsCellData { return tagsCellData{ID: id, Tags: tags} },
+	"join":     strings.Join,
+}).Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -709,9 +941,16 @@ var paperPageTemplate = template.Must(template.New("paper").Parse(`<!DOCTYPE htm
 	<dt>Year</dt><dd>{{if .Paper.Year}}{{.Paper.Year}}{{else}}&mdash;{{end}}</dd>
 	<dt>DOI</dt><dd>{{if .Paper.DOI}}<a href="https://doi.org/{{.Paper.DOI}}">{{.Paper.DOI}}</a>{{else}}&mdash;{{end}}</dd>
 	<dt>PDF</dt><dd><a href="/api/papers/{{.Paper.ID}}/view" target="_blank">view</a> &middot; <a href="/api/papers/{{.Paper.ID}}/download">download</a></dd>
+	<dt>Tags</dt><dd>{{template "tagsCell" (tagsData .Paper.ID .Paper.Tags)}}</dd>
 </dl>
 {{if .Paper.Abstract}}<h2>Abstract</h2>
 <p>{{.Paper.Abstract}}</p>{{end}}
+
+{{if .CitingAvailable}}<h2>Cited by</h2>
+{{if .Paper.DOI}}<div id="citing-works">
+	<button hx-get="/api/papers/{{.Paper.ID}}/citing-works" hx-target="#citing-works" hx-swap="innerHTML">Find works that cite this paper</button>
+</div>{{else}}<p>Add a DOI to this paper to look up works that cite it.</p>{{end}}{{end}}
+
 <h2>Citations ({{len .Citations}})</h2>
 {{if .Citations}}<table border="1" cellpadding="4" cellspacing="0">
 <thead><tr><th>No</th><th>DOI</th><th>Appears on</th><th>Title</th></tr></thead>
@@ -764,4 +1003,29 @@ var _ = template.Must(paperPageTemplate.Parse(`
 	</form>
 	{{- end}}
 </td>
+{{- end}}`))
+
+// tagsCell renders a paper's tags and a small editor that replaces the whole set
+// from a comma-separated field. It is rendered both inline on the paper page and
+// as a standalone HTMX fragment after an edit.
+var _ = template.Must(paperPageTemplate.Parse(`
+{{- define "tagsCell" -}}
+<span id="tags-cell-{{.ID}}">
+	{{- if .Tags}}{{range .Tags}}<small>{{.}}</small> {{end}}{{else}}&mdash; {{end}}
+	<form hx-post="/api/papers/{{.ID}}/tags" hx-target="#tags-cell-{{.ID}}" hx-swap="outerHTML" style="display:inline">
+		<input type="text" name="tags" value="{{join .Tags ", "}}" placeholder="comma, separated, tags" size="30">
+		<button type="submit">save</button>
+	</form>
+</span>
+{{- end}}`))
+
+// citingWorks renders the list of works that cite the paper (OpenAlex). Data is
+// []openalex.Work.
+var _ = template.Must(paperPageTemplate.Parse(`
+{{- define "citingWorks" -}}
+{{if .}}<p>{{len .}} citing work(s):</p>
+<ul>
+{{range .}}	<li>{{if .DOI}}<a href="https://doi.org/{{.DOI}}">{{if .Title}}{{.Title}}{{else}}{{.DOI}}{{end}}</a>{{else}}{{if .Title}}{{.Title}}{{else}}(untitled){{end}}{{end}}{{if .Year}} ({{.Year}}){{end}}</li>
+{{end}}</ul>
+{{else}}<p>No citing works found.</p>{{end}}
 {{- end}}`))

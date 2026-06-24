@@ -1,17 +1,32 @@
-version: '3.8'
-
 services:
   grobid:
     image: lfoppiano/grobid:0.8.0
     container_name: grobid-server
-    ports:
-      - "8070:8070"
+    network_mode: "host" # serves on localhost:8070
     restart: unless-stopped
-    network_mode: "host"
 
-    # Optional: GROBID is memory intensive. 
+    # Optional: GROBID is memory intensive.
     # If it crashes while parsing large PDFs, uncomment the limits below.
     # deploy:
     #   resources:
     #     limits:
     #       memory: 4G
+
+  cite-scout:
+    build: .
+    image: cite-scout:staging
+    container_name: cite-scout
+    network_mode: "host" # serves on localhost:8080; reaches GROBID at localhost:8070
+    # Runtime configuration (GROBID_URL, PAPERS_DIR, GEMINI_API_KEY, ...). The
+    # file is optional; remove this line if you do not use one.
+    env_file:
+      - .env
+    volumes:
+      # Persist the database and stored PDFs on the host. Paths match the
+      # image's working directory (/usr/src/app), where the app reads ./archive.db
+      # and PAPERS_DIR (default data/papers).
+      - ./data:/usr/src/app/data
+      - ./archive.db:/usr/src/app/archive.db
+    depends_on:
+      - grobid
+    restart: unless-stopped
